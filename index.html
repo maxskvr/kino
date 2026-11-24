@@ -19,6 +19,7 @@
   #fname{font-size:13px;color:#aaa;text-align:center;word-break:break-all}
   .hint{font-size:13px;color:#888;line-height:1.4}
   #top{padding:8px 12px;font-size:13px;color:#aaa;text-align:center;min-height:30px}
+  #dbg{padding:0 12px 6px;font:11px/1.4 monospace;color:#6c6}
   #player{display:none}
   body.on #player{display:block}
   body.on #setup{display:none}
@@ -37,9 +38,10 @@
 </head>
 <body>
 <div id="top"></div>
+<div id="dbg"></div>
 
 <div id="setup">
-  <h1>🎬 Смотрим вместе</h1>
+  <h1>🎬 Смотрим вместе <small style="font-size:12px;color:#666">v5</small></h1>
   <label class="btn">Выбрать файл с телефона
     <input type="file" id="file" accept="video/*" hidden>
   </label>
@@ -94,7 +96,20 @@ const P = {
   seek(t){ this.kind === 'yt' ? (this.ytOk() && this.yt.seekTo(t, true)) : (v.currentTime = t); },
 };
 
-function status(t){ $('top').textContent = t; }
+function status(t){ $('top').textContent = t; dbg(t); }
+function dbg(t){
+  const d = document.createElement('div');
+  d.textContent = new Date().toTimeString().slice(0, 8) + ' ' + t;
+  $('dbg').appendChild(d);
+  while ($('dbg').children.length > 8) $('dbg').firstChild.remove();
+}
+// Следим за состоянием видеосоединения
+function watchCall(call){
+  const pc = call.peerConnection;
+  if (!pc){ setTimeout(() => watchCall(call), 300); return; }
+  pc.addEventListener('iceconnectionstatechange', () => dbg('видео-сеть: ' + pc.iceConnectionState));
+  pc.addEventListener('track', e => dbg('пришла дорожка: ' + e.track.kind));
+}
 function addMsg(who, text){
   const d = document.createElement('div');
   const b = document.createElement('b'); b.textContent = who + ': ';
@@ -234,7 +249,8 @@ function callGuest(){
   if (!call){ status('⚠️ Не удалось отправить видео'); return; }
   call.on('error', e => status('⚠️ Ошибка видео: ' + (e.type || e)));
   call.on('close', () => status('Видео у собеседника закрылось'));
-  status('📡 Отправляем видео…');
+  watchCall(call);
+  status('📡 Отправляем видео (дорожек: ' + P.stream.getTracks().length + ')');
 }
 
 // Второй: если видео не пришло, просим ещё раз (до 4 раз)
@@ -242,16 +258,17 @@ function askStream(n){
   setTimeout(() => {
     if (v.srcObject) return;
     if (n >= 4){ status('⚠️ Видео не доходит. Попробуйте другую сеть (Wi-Fi) у одного из вас'); return; }
-    status('Запрашиваем видео ещё раз… (' + (n + 1) + ')');
+    dbg('запрашиваем видео ещё раз (' + (n + 1) + ')');
     send({ type: 'wantStream' });
     askStream(n + 1);
   }, 5000);
 }
 
 function onCall(call){
-  status('Получаем видео…');
+  status('Звонок с видео получен');
   call.on('error', e => status('⚠️ Ошибка видео: ' + (e.type || e)));
   call.answer();
+  watchCall(call);
   call.on('stream', s => {
     if (v.srcObject === s) return;
     resetVideo();
