@@ -227,9 +227,33 @@ $('share').onclick = async () => {
     addMsg('Система', '⚠️ Звук не захвачен. Перезапустите трансляцию и включите «Поделиться звуком вкладки»');
 };
 
+// Создатель: отправить видео второму
+function callGuest(){
+  if (!P.stream || !P.stream.active){ status('⚠️ Трансляция не идёт — нажмите «Транслировать» заново'); return; }
+  const call = peer.call(conn.peer, P.stream);
+  if (!call){ status('⚠️ Не удалось отправить видео'); return; }
+  call.on('error', e => status('⚠️ Ошибка видео: ' + (e.type || e)));
+  call.on('close', () => status('Видео у собеседника закрылось'));
+  status('📡 Отправляем видео…');
+}
+
+// Второй: если видео не пришло, просим ещё раз (до 4 раз)
+function askStream(n){
+  setTimeout(() => {
+    if (v.srcObject) return;
+    if (n >= 4){ status('⚠️ Видео не доходит. Попробуйте другую сеть (Wi-Fi) у одного из вас'); return; }
+    status('Запрашиваем видео ещё раз… (' + (n + 1) + ')');
+    send({ type: 'wantStream' });
+    askStream(n + 1);
+  }, 5000);
+}
+
 function onCall(call){
+  status('Получаем видео…');
+  call.on('error', e => status('⚠️ Ошибка видео: ' + (e.type || e)));
   call.answer();
   call.on('stream', s => {
+    if (v.srcObject === s) return;
     resetVideo();
     P.kind = 'stream'; P.url = null;
     v.srcObject = s;
@@ -267,8 +291,9 @@ function setup(c){
   c.on('open', () => {
     status('✅ Подключено');
     addMsg('Система', 'Вы вместе! Управляйте плеером как обычно — у второго всё повторится.');
-    send({ type: 'hello', dur: P.dur() || 0, url: P.url, stream: P.kind === 'stream' });
-    if (isHost && P.kind === 'stream') peer.call(c.peer, P.stream);
+    const d = P.dur();
+    send({ type: 'hello', dur: isFinite(d) ? d : 0, url: P.url, stream: P.kind === 'stream' });
+    if (isHost && P.kind === 'stream') callGuest();
     else if (isHost) send({ type: 'sync', t: P.time(), paused: P.paused() });
     showPlayer();
   });
@@ -296,10 +321,11 @@ function onData(m){
     if (!m.paused && P.paused()) P.play().catch(() => {});
   });
   else if (m.type === 'chat') addMsg('💬', m.text);
+  else if (m.type === 'wantStream'){ if (isHost && P.kind === 'stream') callGuest(); }
   else if (m.type === 'hello'){
     if (!P.kind){
       if (m.url){ loadUrl(m.url); addMsg('Система', 'Видео открыто по ссылке создателя комнаты. Нажмите ▶, если не запустится.'); }
-      else if (m.stream) status('Подключаем трансляцию…');
+      else if (m.stream){ status('Подключаем трансляцию…'); askStream(0); }
       else status('Создатель смотрит свой файл — выберите такой же файл');
     } else if (P.kind === 'v' && !P.url && v.duration && m.dur && Math.abs(v.duration - m.dur) > 3) {
       addMsg('Система', '⚠️ Длительность файлов отличается — возможно, у вас разные версии фильма');
