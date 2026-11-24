@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Смотрим вместе</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;display:flex;flex-direction:column;min-height:100vh}
+  #setup{padding:24px 16px;max-width:420px;margin:0 auto;width:100%;display:flex;flex-direction:column;gap:12px}
+  h1{font-size:24px;text-align:center;margin:8px 0 16px}
+  .btn,button{background:#e50914;color:#fff;border:0;border-radius:10px;padding:14px;font-size:16px;text-align:center;cursor:pointer}
+  button.alt{background:#333}
+  input[type=text]{background:#222;color:#eee;border:1px solid #444;border-radius:10px;padding:14px;font-size:16px;width:100%}
+  .row{display:flex;gap:8px}.row>*{flex:1}
+  #fname{font-size:13px;color:#aaa;text-align:center;word-break:break-all}
+  .hint{font-size:13px;color:#888;line-height:1.4}
+  #top{padding:8px 12px;font-size:13px;color:#aaa;text-align:center;min-height:30px}
+  video{width:100%;max-height:60vh;background:#000;display:none}
+  body.on video{display:block}
+  body.on #setup{display:none}
+  #chat{display:none;flex:1;flex-direction:column;padding:8px;gap:8px}
+  body.on #chat{display:flex}
+  #log{flex:1;overflow-y:auto;font-size:15px;min-height:80px;max-height:30vh}
+  #log div{padding:4px 0}
+  #log b{color:#e50914}
+  #f{display:flex;gap:8px}
+  #f input{flex:1}
+  #f button{padding:0 18px}
+</style>
+</head>
+<body>
+<div id="top"></div>
+
+<div id="setup">
+  <h1>🎬 Смотрим вместе</h1>
+  <label class="btn">1. Выбрать фильм
+    <input type="file" id="file" accept="video/*" hidden>
+  </label>
+  <div id="fname"></div>
+  <input type="text" id="room" placeholder="2. Код комнаты, например kino123" autocomplete="off">
+  <div class="row">
+    <button id="create">Создать</button>
+    <button id="join" class="alt">Войти</button>
+  </div>
+  <div class="hint">
+    Один человек нажимает «Создать», второй вводит тот же код и нажимает «Войти».
+    У обоих должен быть один и тот же файл фильма.
+  </div>
+</div>
+
+<video id="v" controls playsinline></video>
+
+<div id="chat">
+  <div id="log"></div>
+  <form id="f"><input type="text" id="msg" placeholder="Сообщение…" autocomplete="off"><button>➤</button></form>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const v = $('v');
+const PREFIX = 'smotrim-vmeste-room-';
+let peer = null, conn = null, isHost = false, remote = false;
+
+function status(t){ $('top').textContent = t; }
+function addMsg(who, text){
+  const d = document.createElement('div');
+  const b = document.createElement('b'); b.textContent = who + ': ';
+  d.appendChild(b); d.appendChild(document.createTextNode(text));
+  $('log').appendChild(d); $('log').scrollTop = 1e9;
+}
+function send(m){ if (conn && conn.open) conn.send(m); }
+
+// Изменения, пришедшие от собеседника, не отправляем обратно
+function applyRemote(fn){
+  remote = true; fn();
+  clearTimeout(applyRemote.t);
+  applyRemote.t = setTimeout(() => remote = false, 600);
+}
+
+$('file').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  v.src = URL.createObjectURL(f);
+  $('fname').textContent = '✔ ' + f.name;
+};
+
+function prepare(){
+  if (!v.src){ alert('Сначала выберите фильм'); return null; }
+  const r = $('room').value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!r){ alert('Введите код комнаты (латинские буквы и цифры)'); return null; }
+  // «Разблокируем» воспроизведение на телефоне, пока есть нажатие пользователя
+  v.play().then(() => v.pause()).catch(() => {});
+  return r;
+}
+
+$('create').onclick = () => {
+  const r = prepare(); if (!r) return;
+  isHost = true;
+  peer = new Peer(PREFIX + r);
+  status('Создаём комнату…');
+  peer.on('open', () => status('Комната «' + r + '» создана. Ждём второго…'));
+  peer.on('connection', c => { if (conn) conn.close(); setup(c); });
+  peer.on('error', err => status(err.type === 'unavailable-id'
+    ? 'Этот код уже занят, придумайте другой' : 'Ошибка: ' + err.type));
+};
+
+$('join').onclick = () => {
+  const r = prepare(); if (!r) return;
+  peer = new Peer();
+  status('Подключаемся…');
+  peer.on('open', () => setup(peer.connect(PREFIX + r, { reliable: true })));
+  peer.on('error', err => status(err.type === 'peer-unavailable'
+    ? 'Комната не найдена. Сначала второй человек должен нажать «Создать»' : 'Ошибка: ' + err.type));
+};
+
+function setup(c){
+  conn = c;
+  c.on('open', () => {
+    status('✅ Подключено');
+    document.body.classList.add('on');
+    addMsg('Система', 'Вы вместе! Управляйте плеером как обычно — у второго всё повторится.');
+    send({ type: 'hello', dur: v.duration || 0 });
+    if (isHost) send({ type: 'sync', t: v.currentTime, paused: v.paused });
+  });
+  c.on('data', onData);
+  c.on('close', () => { status('❌ Соединение потеряно'); addMsg('Система', 'Собеседник отключился'); });
+}
+
+function onData(m){
+  const far = (t, d) => Math.abs(v.currentTime - t) > d;
+  if (m.type === 'play') applyRemote(() => {
+    if (far(m.t, 0.5)) v.currentTime = m.t;
+    if (v.paused) v.play().catch(() => status('Нажмите ▶, чтобы продолжить'));
+  });
+  else if (m.type === 'pause') applyRemote(() => {
+    if (!v.paused) v.pause();
+    if (far(m.t, 0.5)) v.currentTime = m.t;
+  });
+  else if (m.type === 'seek') applyRemote(() => {
+    if (far(m.t, 0.5)) v.currentTime = m.t;
+  });
+  else if (m.type === 'sync') applyRemote(() => {
+    if (far(m.t, 1.5)) v.currentTime = m.t;
+    if (m.paused && !v.paused) v.pause();
+    if (!m.paused && v.paused) v.play().catch(() => {});
+  });
+  else if (m.type === 'chat') addMsg('💬', m.text);
+  else if (m.type === 'hello'){
+    if (v.duration && m.dur && Math.abs(v.duration - m.dur) > 3)
+      addMsg('Система', '⚠️ Длительность файлов отличается — возможно, у вас разные версии фильма');
+  }
+}
+
+v.addEventListener('play',   () => { if (!remote) send({ type: 'play',  t: v.currentTime }); });
+v.addEventListener('pause',  () => { if (!remote) send({ type: 'pause', t: v.currentTime }); });
+v.addEventListener('seeked', () => { if (!remote) send({ type: 'seek',  t: v.currentTime }); });
+
+// Создатель комнаты раз в 5 секунд подправляет расхождение
+setInterval(() => { if (isHost && !remote) send({ type: 'sync', t: v.currentTime, paused: v.paused }); }, 5000);
+
+$('f').onsubmit = e => {
+  e.preventDefault();
+  const t = $('msg').value.trim(); if (!t) return;
+  send({ type: 'chat', text: t }); addMsg('Я', t); $('msg').value = '';
+};
+</script>
+</body>
+</html>
