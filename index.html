@@ -19,7 +19,9 @@
   #fname{font-size:13px;color:#aaa;text-align:center;word-break:break-all}
   .hint{font-size:13px;color:#888;line-height:1.4}
   #top{padding:8px 12px;font-size:13px;color:#aaa;text-align:center;min-height:30px}
-  #dbg{padding:0 12px 6px;font:11px/1.4 monospace;color:#6c6}
+  #dbg{padding:0 12px 6px;font:11px/1.4 monospace;color:#6c6;display:none}
+  body.debug #dbg{display:block}
+  .nickrow input[type=color]{flex:0 0 56px;height:52px;padding:4px;background:#222;border:1px solid #444;border-radius:10px}
   #player{display:none}
   body.on #player{display:block}
   body.on #setup{display:none}
@@ -41,13 +43,17 @@
 <div id="dbg"></div>
 
 <div id="setup">
-  <h1>🎬 Смотрим вместе <small style="font-size:12px;color:#666">v6</small></h1>
+  <h1>🎬 Смотрим вместе <small style="font-size:12px;color:#666">v7</small></h1>
   <label class="btn">Выбрать файл с телефона
     <input type="file" id="file" accept="video/*" hidden>
   </label>
   <div class="or">— или —</div>
   <input type="text" id="url" placeholder="Ссылка: YouTube, .mp4 или .m3u8" autocomplete="off">
   <div id="fname"></div>
+  <div class="row nickrow">
+    <input type="text" id="nick" placeholder="Ваш ник" maxlength="20" autocomplete="off">
+    <input type="color" id="color" title="Цвет ника">
+  </div>
   <input type="text" id="room" placeholder="Код комнаты, например kino123" autocomplete="off">
   <div class="row">
     <button id="create">Создать</button>
@@ -55,8 +61,8 @@
   </div>
   <button id="share" class="alt">📺 Транслировать вкладку Chrome (с ПК)</button>
   <div class="hint">
-    Создатель комнаты выбирает файл или вставляет ссылку. Если это ссылка, второму достаточно
-    ввести код и нажать «Войти»: видео откроется у него само. Если это файл, у второго должен быть такой же.
+    Создатель комнаты выбирает файл, ссылку или трансляцию. Остальные вводят тот же код и нажимают «Войти» —
+    зрителей может быть сколько угодно. Если это файл, у каждого должен быть такой же.
   </div>
 </div>
 
@@ -75,6 +81,25 @@ const $ = id => document.getElementById(id);
 const v = $('v');
 const PREFIX = 'smotrim-vmeste-room-';
 let peer = null, conn = null, isHost = false, remote = false, hls = null;
+let conns = [];          // у создателя: все зрители
+let ME = { nick: 'Гость', color: '#e50914' };
+
+// Журнал виден только если открыть сайт с #debug в конце адреса
+if (/debug/.test(location.hash)) document.body.classList.add('debug');
+
+// ---------- Ник и цвет (запоминаются на устройстве) ----------
+const COLORS = ['#ff5c5c', '#ffb347', '#ffd93d', '#6bcb77', '#4d96ff', '#c77dff', '#ff6fb5', '#36cfc9'];
+function store(k, val){
+  try { if (val === undefined) return localStorage.getItem(k); localStorage.setItem(k, val); } catch (e) { return null; }
+}
+$('nick').value = store('nick') || '';
+$('color').value = store('color') || COLORS[Math.floor(Math.random() * COLORS.length)];
+function readMe(){
+  ME = { nick: $('nick').value.trim().slice(0, 20) || 'Гость' + Math.floor(Math.random() * 100), color: $('color').value };
+  store('nick', ME.nick); store('color', ME.color);
+}
+const safeColor = c => /^#[0-9a-f]{6}$/i.test(c || '') ? c : '#e50914';
+const sys = t => addMsg('Система', t, '#888');
 
 // ---------- Единый интерфейс плеера: обычное видео или YouTube ----------
 const P = {
@@ -110,17 +135,22 @@ function watchCall(call){
   pc.addEventListener('iceconnectionstatechange', () => dbg('видео-сеть: ' + pc.iceConnectionState));
   pc.addEventListener('track', e => dbg('пришла дорожка: ' + e.track.kind));
 }
-function addMsg(who, text){
+function addMsg(who, text, color){
   const d = document.createElement('div');
   const b = document.createElement('b'); b.textContent = who + ': ';
+  b.style.color = safeColor(color);
   d.appendChild(b); d.appendChild(document.createTextNode(text));
   $('log').appendChild(d); $('log').scrollTop = 1e9;
 }
-function send(m){ if (conn && conn.open) conn.send(m); }
+// Создатель рассылает всем зрителям (кроме except), зритель — только создателю
+function send(m, except){
+  (isHost ? conns : (conn ? [conn] : [])).forEach(c => { if (c !== except && c.open) c.send(m); });
+}
+function hostStatus(){ status('Комната «' + hostStatus.room + '» · зрителей: ' + conns.filter(c => c.open).length); }
 function showPlayer(){
   v.style.display = P.kind === 'yt' ? 'none' : 'block';
   $('ytwrap').style.display = P.kind === 'yt' ? 'block' : 'none';
-  if (P.kind && conn && conn.open) document.body.classList.add('on');
+  if (P.kind && (isHost || (conn && conn.open))) document.body.classList.add('on');
 }
 
 // Изменения, пришедшие от собеседника, не отправляем обратно
@@ -233,30 +263,34 @@ $('share').onclick = async () => {
   } catch (e) { status('Трансляция отменена'); return; }
   const vt = s.getVideoTracks()[0];
   vt.contentHint = 'motion';
-  vt.onended = () => { status('⏹ Трансляция остановлена'); addMsg('Система', 'Трансляция остановлена'); };
+  vt.onended = () => { status('⏹ Трансляция остановлена'); sys('Трансляция остановлена'); send({ type: 'sys', text: 'Трансляция остановлена' }); };
   resetVideo();
   P.kind = 'stream'; P.url = null; P.stream = s;
   v.srcObject = s; v.muted = true; v.play().catch(() => {});
   startHost(r);
   if (!s.getAudioTracks().length)
-    addMsg('Система', '⚠️ Звук не захвачен. Перезапустите трансляцию и включите «Поделиться звуком вкладки»');
+    sys('⚠️ Звук не захвачен. Перезапустите трансляцию и включите «Поделиться звуком вкладки»');
 };
 
-// Создатель: отправить видео второму
-function callGuest(){
+// Создатель: отправить видео зрителю c
+const pendingCalls = new Set();
+function callGuest(c){
   if (!P.stream || !P.stream.active){ status('⚠️ Трансляция не идёт — нажмите «Транслировать» заново'); return; }
   if (peer.disconnected){
     dbg('нет связи с сервером — переподключаемся, затем отправим видео');
-    if (!callGuest.waiting){ callGuest.waiting = true; peer.once('open', () => { callGuest.waiting = false; callGuest(); }); }
+    pendingCalls.add(c);
+    if (!callGuest.waiting){
+      callGuest.waiting = true;
+      peer.once('open', () => { callGuest.waiting = false; const l = [...pendingCalls]; pendingCalls.clear(); l.forEach(callGuest); });
+    }
     if (!peer.destroyed) peer.reconnect();
     return;
   }
-  const call = peer.call(conn.peer, P.stream);
-  if (!call){ status('⚠️ Не удалось отправить видео'); return; }
-  call.on('error', e => status('⚠️ Ошибка видео: ' + (e.type || e)));
-  call.on('close', () => status('Видео у собеседника закрылось'));
+  const call = peer.call(c.peer, P.stream);
+  if (!call){ dbg('не удалось отправить видео'); return; }
+  call.on('error', e => dbg('ошибка видео: ' + (e.type || e)));
   watchCall(call);
-  status('📡 Отправляем видео (дорожек: ' + P.stream.getTracks().length + ')');
+  dbg('отправляем видео ' + (c.nick || c.peer));
 }
 
 // Второй: если видео не пришло, просим ещё раз (до 4 раз)
@@ -271,7 +305,7 @@ function askStream(n){
 }
 
 function onCall(call){
-  status('Звонок с видео получен');
+  dbg('звонок с видео получен');
   call.on('error', e => status('⚠️ Ошибка видео: ' + (e.type || e)));
   call.answer();
   watchCall(call);
@@ -298,18 +332,25 @@ function keepAlive(p){
 }
 
 function startHost(r){
-  isHost = true;
+  readMe();
+  isHost = true; hostStatus.room = r;
   peer = new Peer(PREFIX + r);
   keepAlive(peer);
   status('Создаём комнату…');
-  peer.on('open', () => { if (!conn) status('Комната «' + r + '» создана. Ждём второго…'); else dbg('связь с сервером восстановлена'); });
-  peer.on('connection', c => { if (conn) conn.close(); setup(c); });
+  peer.once('open', () => {
+    hostStatus();
+    showPlayer();
+    sys('Комната «' + r + '» создана. Отправьте друзьям код — они вводят его и нажимают «Войти».');
+  });
+  peer.on('open', () => dbg('связь с сервером есть'));
+  peer.on('connection', setup);
   peer.on('error', err => status(err.type === 'unavailable-id'
     ? 'Этот код уже занят, придумайте другой' : 'Ошибка: ' + err.type));
 }
 
 $('join').onclick = () => {
   const r = prepare(false); if (!r) return;
+  readMe();
   peer = new Peer();
   keepAlive(peer);
   peer.on('call', onCall);
@@ -320,22 +361,41 @@ $('join').onclick = () => {
 };
 
 function setup(c){
-  conn = c;
+  if (isHost) conns.push(c); else conn = c;
   c.on('open', () => {
-    status('✅ Подключено');
-    addMsg('Система', 'Вы вместе! Управляйте плеером как обычно — у второго всё повторится.');
-    const d = P.dur();
-    send({ type: 'hello', dur: isFinite(d) ? d : 0, url: P.url, stream: P.kind === 'stream' });
-    if (isHost && P.kind === 'stream') callGuest();
-    else if (isHost) send({ type: 'sync', t: P.time(), paused: P.paused() });
+    if (isHost){
+      const d = P.dur();
+      c.send({ type: 'hello', dur: isFinite(d) ? d : 0, url: P.url, stream: P.kind === 'stream', nick: ME.nick, color: ME.color });
+      if (P.kind === 'stream') callGuest(c);
+      else c.send({ type: 'sync', t: P.time(), paused: P.paused() });
+      hostStatus();
+    } else {
+      status('✅ Подключено');
+      c.send({ type: 'hello', nick: ME.nick, color: ME.color });
+    }
     showPlayer();
   });
-  c.on('data', onData);
-  c.on('close', () => { status('❌ Соединение потеряно'); addMsg('Система', 'Собеседник отключился'); });
+  c.on('data', m => onData(m, c));
+  c.on('close', () => {
+    if (isHost){
+      conns = conns.filter(x => x !== c);
+      const t = (c.nick || 'Кто-то') + ' вышел(а)';
+      sys(t); send({ type: 'sys', text: t });
+      hostStatus();
+    } else { status('❌ Соединение потеряно'); sys('Соединение с комнатой потеряно'); }
+  });
 }
 
-function onData(m){
+function onData(m, c){
   const far = (t, d) => Math.abs(P.time() - t) > d;
+  // Создатель пересылает действия и чат одного зрителя всем остальным
+  if (isHost && /^(play|pause|seek|chat)$/.test(m.type)) send(m, c);
+  if (isHost && m.type === 'hello'){
+    c.nick = String(m.nick || 'Гость').slice(0, 20);
+    const t = c.nick + ' присоединился(ась)';
+    sys(t); send({ type: 'sys', text: t }, c);
+    return;
+  }
   if (P.kind === 'stream' && /^(play|pause|seek|sync)$/.test(m.type)) return;
   if (m.type === 'play') applyRemote(() => {
     if (far(m.t, 1)) P.seek(m.t);
@@ -353,15 +413,17 @@ function onData(m){
     if (m.paused && !P.paused()) P.pause();
     if (!m.paused && P.paused()) P.play().catch(() => {});
   });
-  else if (m.type === 'chat') addMsg('💬', m.text);
-  else if (m.type === 'wantStream'){ if (isHost && P.kind === 'stream') callGuest(); }
+  else if (m.type === 'chat') addMsg(String(m.nick || '?').slice(0, 20), String(m.text), m.color);
+  else if (m.type === 'sys') sys(String(m.text));
+  else if (m.type === 'wantStream'){ if (isHost && P.kind === 'stream') callGuest(c); }
   else if (m.type === 'hello'){
+    sys('Вы в комнате у ' + String(m.nick || 'создателя').slice(0, 20) + '. Управляйте плеером как обычно — у всех всё повторится.');
     if (!P.kind){
-      if (m.url){ loadUrl(m.url); addMsg('Система', 'Видео открыто по ссылке создателя комнаты. Нажмите ▶, если не запустится.'); }
+      if (m.url){ loadUrl(m.url); sys('Видео открыто по ссылке создателя комнаты. Нажмите ▶, если не запустится.'); }
       else if (m.stream){ status('Подключаем трансляцию…'); askStream(0); }
       else status('Создатель смотрит свой файл — выберите такой же файл');
     } else if (P.kind === 'v' && !P.url && v.duration && m.dur && Math.abs(v.duration - m.dur) > 3) {
-      addMsg('Система', '⚠️ Длительность файлов отличается — возможно, у вас разные версии фильма');
+      sys('⚠️ Длительность файлов отличается — возможно, у вас разные версии фильма');
     }
   }
 }
@@ -393,7 +455,8 @@ setInterval(() => { if (isHost && !remote && P.kind !== 'stream') send({ type: '
 $('f').onsubmit = e => {
   e.preventDefault();
   const t = $('msg').value.trim(); if (!t) return;
-  send({ type: 'chat', text: t }); addMsg('Я', t); $('msg').value = '';
+  send({ type: 'chat', text: t, nick: ME.nick, color: ME.color });
+  addMsg(ME.nick, t, ME.color); $('msg').value = '';
 };
 </script>
 </body>
