@@ -51,6 +51,7 @@
     <button id="create">Создать</button>
     <button id="join" class="alt">Войти</button>
   </div>
+  <button id="share" class="alt">📺 Транслировать вкладку Chrome (с ПК)</button>
   <div class="hint">
     Создатель комнаты выбирает файл или вставляет ссылку. Если это ссылка, второму достаточно
     ввести код и нажать «Войти»: видео откроется у него само. Если это файл, у второго должен быть такой же.
@@ -117,6 +118,7 @@ function applyRemote(fn){
 // ---------- Загрузка источников ----------
 function resetVideo(){
   if (hls){ hls.destroy(); hls = null; }
+  v.srcObject = null; v.muted = false;
   v.removeAttribute('src'); v.load();
 }
 
@@ -187,15 +189,60 @@ function prepare(needSource){
   const u = $('url').value.trim();
   if (u && u !== P.url) loadUrl(u);
   if (needSource && !P.kind){ alert('Сначала выберите файл или вставьте ссылку'); return null; }
-  const r = $('room').value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (!r){ alert('Введите код комнаты (латинские буквы и цифры)'); return null; }
+  const r = roomCode(); if (!r) return null;
   // «Разблокируем» воспроизведение на телефоне, пока есть нажатие пользователя
   if (P.kind === 'v') v.play().then(() => v.pause()).catch(() => {});
   return r;
 }
 
-$('create').onclick = () => {
-  const r = prepare(true); if (!r) return;
+function roomCode(){
+  const r = $('room').value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!r) alert('Введите код комнаты (латинские буквы и цифры)');
+  return r || null;
+}
+
+$('create').onclick = () => { const r = prepare(true); if (r) startHost(r); };
+
+// ---------- Трансляция вкладки ----------
+if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia || /Android|iPhone|iPad/i.test(navigator.userAgent))
+  $('share').style.display = 'none';
+
+$('share').onclick = async () => {
+  const r = roomCode(); if (!r) return;
+  let s;
+  try {
+    s = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 30 }, audio: true,
+      selfBrowserSurface: 'exclude', surfaceSwitching: 'include'
+    });
+  } catch (e) { status('Трансляция отменена'); return; }
+  const vt = s.getVideoTracks()[0];
+  vt.contentHint = 'motion';
+  vt.onended = () => { status('⏹ Трансляция остановлена'); addMsg('Система', 'Трансляция остановлена'); };
+  resetVideo();
+  P.kind = 'stream'; P.url = null; P.stream = s;
+  v.srcObject = s; v.muted = true; v.play().catch(() => {});
+  startHost(r);
+  if (!s.getAudioTracks().length)
+    addMsg('Система', '⚠️ Звук не захвачен. Перезапустите трансляцию и включите «Поделиться звуком вкладки»');
+};
+
+function onCall(call){
+  call.answer();
+  call.on('stream', s => {
+    resetVideo();
+    P.kind = 'stream'; P.url = null;
+    v.srcObject = s;
+    showPlayer();
+    v.play().catch(() => {
+      v.muted = true; v.play().catch(() => {});
+      status('🔇 Нажмите на видео, чтобы включить звук');
+      v.addEventListener('click', () => { v.muted = false; status('✅ Подключено'); }, { once: true });
+    });
+  });
+}
+
+function startHost(r){
   isHost = true;
   peer = new Peer(PREFIX + r);
   status('Создаём комнату…');
@@ -203,11 +250,12 @@ $('create').onclick = () => {
   peer.on('connection', c => { if (conn) conn.close(); setup(c); });
   peer.on('error', err => status(err.type === 'unavailable-id'
     ? 'Этот код уже занят, придумайте другой' : 'Ошибка: ' + err.type));
-};
+}
 
 $('join').onclick = () => {
   const r = prepare(false); if (!r) return;
   peer = new Peer();
+  peer.on('call', onCall);
   status('Подключаемся…');
   peer.on('open', () => setup(peer.connect(PREFIX + r, { reliable: true })));
   peer.on('error', err => status(err.type === 'peer-unavailable'
@@ -219,8 +267,9 @@ function setup(c){
   c.on('open', () => {
     status('✅ Подключено');
     addMsg('Система', 'Вы вместе! Управляйте плеером как обычно — у второго всё повторится.');
-    send({ type: 'hello', dur: P.dur() || 0, url: P.url });
-    if (isHost) send({ type: 'sync', t: P.time(), paused: P.paused() });
+    send({ type: 'hello', dur: P.dur() || 0, url: P.url, stream: P.kind === 'stream' });
+    if (isHost && P.kind === 'stream') peer.call(c.peer, P.stream);
+    else if (isHost) send({ type: 'sync', t: P.time(), paused: P.paused() });
     showPlayer();
   });
   c.on('data', onData);
@@ -229,6 +278,7 @@ function setup(c){
 
 function onData(m){
   const far = (t, d) => Math.abs(P.time() - t) > d;
+  if (P.kind === 'stream' && /^(play|pause|seek|sync)$/.test(m.type)) return;
   if (m.type === 'play') applyRemote(() => {
     if (far(m.t, 1)) P.seek(m.t);
     if (P.paused()) P.play().catch(() => status('Нажмите ▶, чтобы продолжить'));
@@ -249,6 +299,7 @@ function onData(m){
   else if (m.type === 'hello'){
     if (!P.kind){
       if (m.url){ loadUrl(m.url); addMsg('Система', 'Видео открыто по ссылке создателя комнаты. Нажмите ▶, если не запустится.'); }
+      else if (m.stream) status('Подключаем трансляцию…');
       else status('Создатель смотрит свой файл — выберите такой же файл');
     } else if (P.kind === 'v' && !P.url && v.duration && m.dur && Math.abs(v.duration - m.dur) > 3) {
       addMsg('Система', '⚠️ Длительность файлов отличается — возможно, у вас разные версии фильма');
@@ -257,9 +308,9 @@ function onData(m){
 }
 
 // ---------- Отправка своих действий ----------
-v.addEventListener('play',   () => { if (!remote) send({ type: 'play',  t: v.currentTime }); });
-v.addEventListener('pause',  () => { if (!remote) send({ type: 'pause', t: v.currentTime }); });
-v.addEventListener('seeked', () => { if (!remote) send({ type: 'seek',  t: v.currentTime }); });
+v.addEventListener('play',   () => { if (!remote && P.kind === 'v') send({ type: 'play',  t: v.currentTime }); });
+v.addEventListener('pause',  () => { if (!remote && P.kind === 'v') send({ type: 'pause', t: v.currentTime }); });
+v.addEventListener('seeked', () => { if (!remote && P.kind === 'v') send({ type: 'seek',  t: v.currentTime }); });
 
 function onYT(e){
   if (remote) return;
@@ -278,7 +329,7 @@ setInterval(() => {
 }, 1000);
 
 // Создатель комнаты раз в 5 секунд подправляет расхождение
-setInterval(() => { if (isHost && !remote) send({ type: 'sync', t: P.time(), paused: P.paused() }); }, 5000);
+setInterval(() => { if (isHost && !remote && P.kind !== 'stream') send({ type: 'sync', t: P.time(), paused: P.paused() }); }, 5000);
 
 $('f').onsubmit = e => {
   e.preventDefault();
