@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Смотрим вместе</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;display:flex;flex-direction:column;min-height:100vh}
+  #setup{padding:24px 16px;max-width:420px;margin:0 auto;width:100%;display:flex;flex-direction:column;gap:12px}
+  h1{font-size:24px;text-align:center;margin:8px 0 16px}
+  .btn,button{background:#e50914;color:#fff;border:0;border-radius:10px;padding:14px;font-size:16px;text-align:center;cursor:pointer}
+  button.alt{background:#333}
+  input[type=text]{background:#222;color:#eee;border:1px solid #444;border-radius:10px;padding:14px;font-size:16px;width:100%}
+  .row{display:flex;gap:8px}.row>*{flex:1}
+  .or{text-align:center;color:#777;font-size:13px}
+  #fname{font-size:13px;color:#aaa;text-align:center;word-break:break-all}
+  .hint{font-size:13px;color:#888;line-height:1.4}
+  #top{padding:8px 12px;font-size:13px;color:#aaa;text-align:center;min-height:30px}
+  #player{display:none}
+  body.on #player{display:block}
+  body.on #setup{display:none}
+  video{width:100%;max-height:60vh;background:#000;display:block}
+  #ytwrap{position:relative;width:100%;padding-top:56.25%;background:#000;display:none}
+  #ytwrap iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+  #chat{display:none;flex:1;flex-direction:column;padding:8px;gap:8px}
+  body.on #chat{display:flex}
+  #log{flex:1;overflow-y:auto;font-size:15px;min-height:80px;max-height:30vh}
+  #log div{padding:4px 0}
+  #log b{color:#e50914}
+  #f{display:flex;gap:8px}
+  #f input{flex:1}
+  #f button{padding:0 18px}
+</style>
+</head>
+<body>
+<div id="top"></div>
+
+<div id="setup">
+  <h1>🎬 Смотрим вместе</h1>
+  <label class="btn">Выбрать файл с телефона
+    <input type="file" id="file" accept="video/*" hidden>
+  </label>
+  <div class="or">— или —</div>
+  <input type="text" id="url" placeholder="Ссылка: YouTube, .mp4 или .m3u8" autocomplete="off">
+  <div id="fname"></div>
+  <input type="text" id="room" placeholder="Код комнаты, например kino123" autocomplete="off">
+  <div class="row">
+    <button id="create">Создать</button>
+    <button id="join" class="alt">Войти</button>
+  </div>
+  <div class="hint">
+    Создатель комнаты выбирает файл или вставляет ссылку. Если это ссылка, второму достаточно
+    ввести код и нажать «Войти»: видео откроется у него само. Если это файл, у второго должен быть такой же.
+  </div>
+</div>
+
+<div id="player">
+  <video id="v" controls playsinline></video>
+  <div id="ytwrap"><div id="ytbox"></div></div>
+</div>
+
+<div id="chat">
+  <div id="log"></div>
+  <form id="f"><input type="text" id="msg" placeholder="Сообщение…" autocomplete="off"><button>➤</button></form>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const v = $('v');
+const PREFIX = 'smotrim-vmeste-room-';
+let peer = null, conn = null, isHost = false, remote = false, hls = null;
+
+// ---------- Единый интерфейс плеера: обычное видео или YouTube ----------
+const P = {
+  kind: null, url: null, yt: null,
+  ytOk(){ return this.yt && this.yt.getCurrentTime; },
+  time(){ return this.kind === 'yt' ? (this.ytOk() ? this.yt.getCurrentTime() : 0) : v.currentTime; },
+  dur(){ return this.kind === 'yt' ? (this.ytOk() ? this.yt.getDuration() : 0) : v.duration; },
+  paused(){
+    if (this.kind !== 'yt') return v.paused;
+    if (!this.ytOk()) return true;
+    const s = this.yt.getPlayerState();
+    return s !== 1 && s !== 3; // 1 = идёт, 3 = буферизация
+  },
+  play(){
+    if (this.kind === 'yt'){ if (this.ytOk()) this.yt.playVideo(); return Promise.resolve(); }
+    return v.play();
+  },
+  pause(){ this.kind === 'yt' ? (this.ytOk() && this.yt.pauseVideo()) : v.pause(); },
+  seek(t){ this.kind === 'yt' ? (this.ytOk() && this.yt.seekTo(t, true)) : (v.currentTime = t); },
+};
+
+function status(t){ $('top').textContent = t; }
+function addMsg(who, text){
+  const d = document.createElement('div');
+  const b = document.createElement('b'); b.textContent = who + ': ';
+  d.appendChild(b); d.appendChild(document.createTextNode(text));
+  $('log').appendChild(d); $('log').scrollTop = 1e9;
+}
+function send(m){ if (conn && conn.open) conn.send(m); }
+function showPlayer(){
+  v.style.display = P.kind === 'yt' ? 'none' : 'block';
+  $('ytwrap').style.display = P.kind === 'yt' ? 'block' : 'none';
+  if (P.kind && conn && conn.open) document.body.classList.add('on');
+}
+
+// Изменения, пришедшие от собеседника, не отправляем обратно
+function applyRemote(fn){
+  remote = true; fn();
+  clearTimeout(applyRemote.t);
+  applyRemote.t = setTimeout(() => remote = false, P.kind === 'yt' ? 2000 : 600);
+}
+
+// ---------- Загрузка источников ----------
+function resetVideo(){
+  if (hls){ hls.destroy(); hls = null; }
+  v.removeAttribute('src'); v.load();
+}
+
+function loadFile(f){
+  resetVideo();
+  P.kind = 'v'; P.url = null;
+  v.src = URL.createObjectURL(f);
+  $('fname').textContent = '✔ ' + f.name;
+  showPlayer();
+}
+
+function ytId(u){
+  const m = u.match(/(?:youtu\.be\/|[?&]v=|shorts\/|embed\/|live\/)([\w-]{11})/);
+  return m && m[1];
+}
+
+function loadUrl(u){
+  P.url = u;
+  const id = ytId(u);
+  if (id){ resetVideo(); loadYT(id); $('fname').textContent = '✔ YouTube'; showPlayer(); return; }
+  resetVideo();
+  P.kind = 'v';
+  if (/\.m3u8(\?|#|$)/i.test(u) && !v.canPlayType('application/vnd.apple.mpegurl')){
+    if (window.Hls && Hls.isSupported()){
+      hls = new Hls();
+      hls.loadSource(u);
+      hls.attachMedia(v);
+      hls.on(Hls.Events.ERROR, (e, d) => {
+        if (d.fatal) status('⚠️ Поток не загружается: ссылка устарела или сайт не разрешает смотреть его на других страницах');
+      });
+    } else status('Этот браузер не умеет играть .m3u8');
+  } else {
+    v.src = u;
+  }
+  $('fname').textContent = '✔ Ссылка добавлена';
+  showPlayer();
+}
+
+v.addEventListener('error', () => {
+  if (P.url && P.kind === 'v' && !hls)
+    status('⚠️ Видео не загружается: ссылка устарела, нужен https или сайт запрещает');
+});
+
+function loadYT(id){
+  P.kind = 'yt';
+  const make = () => {
+    if (P.yt && P.yt.loadVideoById){ P.yt.cueVideoById(id); return; }
+    P.yt = new YT.Player('ytbox', {
+      videoId: id,
+      playerVars: { playsinline: 1, rel: 0 },
+      events: { onStateChange: onYT }
+    });
+  };
+  if (window.YT && YT.Player) make();
+  else {
+    window.onYouTubeIframeAPIReady = make;
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+  }
+}
+
+$('file').onchange = e => { const f = e.target.files[0]; if (f){ $('url').value = ''; loadFile(f); } };
+$('url').onchange = () => { const u = $('url').value.trim(); if (u) loadUrl(u); };
+
+// ---------- Комната ----------
+function prepare(needSource){
+  const u = $('url').value.trim();
+  if (u && u !== P.url) loadUrl(u);
+  if (needSource && !P.kind){ alert('Сначала выберите файл или вставьте ссылку'); return null; }
+  const r = $('room').value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!r){ alert('Введите код комнаты (латинские буквы и цифры)'); return null; }
+  // «Разблокируем» воспроизведение на телефоне, пока есть нажатие пользователя
+  if (P.kind === 'v') v.play().then(() => v.pause()).catch(() => {});
+  return r;
+}
+
+$('create').onclick = () => {
+  const r = prepare(true); if (!r) return;
+  isHost = true;
+  peer = new Peer(PREFIX + r);
+  status('Создаём комнату…');
+  peer.on('open', () => status('Комната «' + r + '» создана. Ждём второго…'));
+  peer.on('connection', c => { if (conn) conn.close(); setup(c); });
+  peer.on('error', err => status(err.type === 'unavailable-id'
+    ? 'Этот код уже занят, придумайте другой' : 'Ошибка: ' + err.type));
+};
+
+$('join').onclick = () => {
+  const r = prepare(false); if (!r) return;
+  peer = new Peer();
+  status('Подключаемся…');
+  peer.on('open', () => setup(peer.connect(PREFIX + r, { reliable: true })));
+  peer.on('error', err => status(err.type === 'peer-unavailable'
+    ? 'Комната не найдена. Сначала второй человек должен нажать «Создать»' : 'Ошибка: ' + err.type));
+};
+
+function setup(c){
+  conn = c;
+  c.on('open', () => {
+    status('✅ Подключено');
+    addMsg('Система', 'Вы вместе! Управляйте плеером как обычно — у второго всё повторится.');
+    send({ type: 'hello', dur: P.dur() || 0, url: P.url });
+    if (isHost) send({ type: 'sync', t: P.time(), paused: P.paused() });
+    showPlayer();
+  });
+  c.on('data', onData);
+  c.on('close', () => { status('❌ Соединение потеряно'); addMsg('Система', 'Собеседник отключился'); });
+}
+
+function onData(m){
+  const far = (t, d) => Math.abs(P.time() - t) > d;
+  if (m.type === 'play') applyRemote(() => {
+    if (far(m.t, 1)) P.seek(m.t);
+    if (P.paused()) P.play().catch(() => status('Нажмите ▶, чтобы продолжить'));
+  });
+  else if (m.type === 'pause') applyRemote(() => {
+    if (!P.paused()) P.pause();
+    if (far(m.t, 1)) P.seek(m.t);
+  });
+  else if (m.type === 'seek') applyRemote(() => {
+    if (far(m.t, 1)) P.seek(m.t);
+  });
+  else if (m.type === 'sync') applyRemote(() => {
+    if (far(m.t, 2)) P.seek(m.t);
+    if (m.paused && !P.paused()) P.pause();
+    if (!m.paused && P.paused()) P.play().catch(() => {});
+  });
+  else if (m.type === 'chat') addMsg('💬', m.text);
+  else if (m.type === 'hello'){
+    if (!P.kind){
+      if (m.url){ loadUrl(m.url); addMsg('Система', 'Видео открыто по ссылке создателя комнаты. Нажмите ▶, если не запустится.'); }
+      else status('Создатель смотрит свой файл — выберите такой же файл');
+    } else if (P.kind === 'v' && !P.url && v.duration && m.dur && Math.abs(v.duration - m.dur) > 3) {
+      addMsg('Система', '⚠️ Длительность файлов отличается — возможно, у вас разные версии фильма');
+    }
+  }
+}
+
+// ---------- Отправка своих действий ----------
+v.addEventListener('play',   () => { if (!remote) send({ type: 'play',  t: v.currentTime }); });
+v.addEventListener('pause',  () => { if (!remote) send({ type: 'pause', t: v.currentTime }); });
+v.addEventListener('seeked', () => { if (!remote) send({ type: 'seek',  t: v.currentTime }); });
+
+function onYT(e){
+  if (remote) return;
+  if (e.data === 1) send({ type: 'play',  t: P.time() });
+  if (e.data === 2) send({ type: 'pause', t: P.time() });
+}
+
+// YouTube не сообщает о перемотке — замечаем скачки времени сами
+let lastT = 0, lastTs = 0;
+setInterval(() => {
+  if (P.kind !== 'yt' || !P.ytOk()) return;
+  const now = Date.now(), t = P.time();
+  const expected = lastT + (P.paused() ? 0 : (now - lastTs) / 1000);
+  if (lastTs && !remote && Math.abs(t - expected) > 2) send({ type: 'seek', t });
+  lastT = t; lastTs = now;
+}, 1000);
+
+// Создатель комнаты раз в 5 секунд подправляет расхождение
+setInterval(() => { if (isHost && !remote) send({ type: 'sync', t: P.time(), paused: P.paused() }); }, 5000);
+
+$('f').onsubmit = e => {
+  e.preventDefault();
+  const t = $('msg').value.trim(); if (!t) return;
+  send({ type: 'chat', text: t }); addMsg('Я', t); $('msg').value = '';
+};
+</script>
+</body>
+</html>
