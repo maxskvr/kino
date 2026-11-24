@@ -21,6 +21,12 @@
   #top{padding:8px 12px;font-size:13px;color:#aaa;text-align:center;min-height:30px}
   #dbg{padding:0 12px 6px;font:11px/1.4 monospace;color:#6c6;display:none}
   body.debug #dbg{display:block}
+  #hostbar{display:none;padding:8px}
+  body.host #hostbar{display:block}
+  #chsrc{width:100%}
+  #srcpanel{display:none;flex-direction:column;gap:10px;margin-top:10px}
+  #srcpanel.open{display:flex}
+  #gfile{display:none;margin:8px}
   .nickrow input[type=color]{flex:0 0 56px;height:52px;padding:4px;background:#222;border:1px solid #444;border-radius:10px}
   #player{display:none}
   body.on #player{display:block}
@@ -43,7 +49,7 @@
 <div id="dbg"></div>
 
 <div id="setup">
-  <h1>🎬 Смотрим вместе <small style="font-size:12px;color:#666">v7</small></h1>
+  <h1>🎬 Смотрим вместе <small style="font-size:12px;color:#666">v8</small></h1>
   <label class="btn">Выбрать файл с телефона
     <input type="file" id="file" accept="video/*" hidden>
   </label>
@@ -69,6 +75,19 @@
 <div id="player">
   <video id="v" controls playsinline></video>
   <div id="ytwrap"><div id="ytbox"></div></div>
+  <label id="gfile" class="btn">📁 Выбрать такой же файл<input type="file" id="file3" accept="video/*" hidden></label>
+  <div id="hostbar">
+    <button id="chsrc" class="alt">🔄 Сменить источник</button>
+    <div id="srcpanel">
+      <label class="btn">Выбрать файл<input type="file" id="file2" accept="video/*" hidden></label>
+      <div class="or">— или —</div>
+      <div class="row">
+        <input type="text" id="url2" placeholder="Ссылка: YouTube, .mp4 или .m3u8" autocomplete="off">
+        <button id="open2" style="flex:0 0 auto">Открыть</button>
+      </div>
+      <button id="share2" class="alt">📺 Транслировать вкладку Chrome</button>
+    </div>
+  </div>
 </div>
 
 <div id="chat">
@@ -163,13 +182,14 @@ function applyRemote(fn){
 // ---------- Загрузка источников ----------
 function resetVideo(){
   if (hls){ hls.destroy(); hls = null; }
+  if (P.yt && P.yt.stopVideo) P.yt.stopVideo();
   v.srcObject = null; v.muted = false;
   v.removeAttribute('src'); v.load();
 }
 
 function loadFile(f){
   resetVideo();
-  P.kind = 'v'; P.url = null;
+  P.kind = 'v'; P.url = null; P.fileName = f.name;
   v.src = URL.createObjectURL(f);
   $('fname').textContent = '✔ ' + f.name;
   showPlayer();
@@ -181,7 +201,7 @@ function ytId(u){
 }
 
 function loadUrl(u){
-  P.url = u;
+  P.url = u; P.fileName = null;
   const id = ytId(u);
   if (id){ resetVideo(); loadYT(id); $('fname').textContent = '✔ YouTube'; showPlayer(); return; }
   resetVideo();
@@ -250,26 +270,69 @@ $('create').onclick = () => { const r = prepare(true); if (r) startHost(r); };
 
 // ---------- Трансляция вкладки ----------
 if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia || /Android|iPhone|iPad/i.test(navigator.userAgent))
+{
   $('share').style.display = 'none';
+  $('share2').style.display = 'none';
+}
 
-$('share').onclick = async () => {
-  const r = roomCode(); if (!r) return;
+async function startShare(){
   let s;
   try {
     s = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: 30 }, audio: true,
       selfBrowserSurface: 'exclude', surfaceSwitching: 'include'
     });
-  } catch (e) { status('Трансляция отменена'); return; }
+  } catch (e) { status('Трансляция отменена'); return false; }
   const vt = s.getVideoTracks()[0];
   vt.contentHint = 'motion';
   vt.onended = () => { status('⏹ Трансляция остановлена'); sys('Трансляция остановлена'); send({ type: 'sys', text: 'Трансляция остановлена' }); };
-  resetVideo();
-  P.kind = 'stream'; P.url = null; P.stream = s;
+  stopStream(); resetVideo();
+  P.kind = 'stream'; P.url = null; P.fileName = null; P.stream = s;
   v.srcObject = s; v.muted = true; v.play().catch(() => {});
-  startHost(r);
   if (!s.getAudioTracks().length)
     sys('⚠️ Звук не захвачен. Перезапустите трансляцию и включите «Поделиться звуком вкладки»');
+  return true;
+}
+
+$('share').onclick = async () => {
+  const r = roomCode(); if (!r) return;
+  if (await startShare()) startHost(r);
+};
+
+// Остановить прежнюю трансляцию и видеозвонки зрителям
+let activeCalls = [];
+function stopStream(){
+  if (P.stream){ P.stream.getTracks().forEach(t => t.stop()); P.stream = null; }
+  activeCalls.forEach(c => { try { c.close(); } catch (e) {} });
+  activeCalls = [];
+}
+
+// ---------- Смена источника (только у создателя) ----------
+$('chsrc').onclick = () => $('srcpanel').classList.toggle('open');
+function announce(m, text){
+  send(m); sys(text); showPlayer();
+  $('srcpanel').classList.remove('open');
+}
+$('file2').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  stopStream(); loadFile(f); e.target.value = '';
+  announce({ type: 'src', file: f.name }, 'Источник: файл «' + f.name + '»');
+};
+$('open2').onclick = () => {
+  const u = $('url2').value.trim(); if (!u) return;
+  stopStream(); loadUrl(u); $('url2').value = '';
+  announce({ type: 'src', url: u }, 'Источник: ссылка');
+};
+$('share2').onclick = async () => {
+  if (!(await startShare())) return;
+  announce({ type: 'src', stream: true }, 'Источник: трансляция вкладки');
+  setTimeout(() => conns.forEach(c => { if (c.open) callGuest(c); }), 700);
+};
+
+// Зритель: выбрать такой же файл, как у создателя
+$('file3').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  loadFile(f); $('gfile').style.display = 'none';
 };
 
 // Создатель: отправить видео зрителю c
@@ -288,6 +351,7 @@ function callGuest(c){
   }
   const call = peer.call(c.peer, P.stream);
   if (!call){ dbg('не удалось отправить видео'); return; }
+  activeCalls.push(call);
   call.on('error', e => dbg('ошибка видео: ' + (e.type || e)));
   watchCall(call);
   dbg('отправляем видео ' + (c.nick || c.peer));
@@ -334,6 +398,7 @@ function keepAlive(p){
 function startHost(r){
   readMe();
   isHost = true; hostStatus.room = r;
+  document.body.classList.add('host');
   peer = new Peer(PREFIX + r);
   keepAlive(peer);
   status('Создаём комнату…');
@@ -415,6 +480,19 @@ function onData(m, c){
   });
   else if (m.type === 'chat') addMsg(String(m.nick || '?').slice(0, 20), String(m.text), m.color);
   else if (m.type === 'sys') sys(String(m.text));
+  else if (m.type === 'src' && !isHost){
+    $('gfile').style.display = 'none';
+    if (m.url){ loadUrl(m.url); sys('Создатель сменил видео. Нажмите ▶, если не запустится.'); }
+    else if (m.stream){
+      resetVideo(); P.kind = 'stream'; P.url = null; showPlayer();
+      sys('Создатель включил трансляцию вкладки'); askStream(0);
+    }
+    else if (m.file){
+      resetVideo(); P.kind = 'v'; P.url = null; showPlayer();
+      sys('Создатель включил файл «' + String(m.file) + '» — выберите такой же');
+      $('gfile').style.display = 'block';
+    }
+  }
   else if (m.type === 'wantStream'){ if (isHost && P.kind === 'stream') callGuest(c); }
   else if (m.type === 'hello'){
     sys('Вы в комнате у ' + String(m.nick || 'создателя').slice(0, 20) + '. Управляйте плеером как обычно — у всех всё повторится.');
