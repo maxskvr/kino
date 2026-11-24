@@ -41,7 +41,7 @@
 <div id="dbg"></div>
 
 <div id="setup">
-  <h1>🎬 Смотрим вместе <small style="font-size:12px;color:#666">v5</small></h1>
+  <h1>🎬 Смотрим вместе <small style="font-size:12px;color:#666">v6</small></h1>
   <label class="btn">Выбрать файл с телефона
     <input type="file" id="file" accept="video/*" hidden>
   </label>
@@ -245,6 +245,12 @@ $('share').onclick = async () => {
 // Создатель: отправить видео второму
 function callGuest(){
   if (!P.stream || !P.stream.active){ status('⚠️ Трансляция не идёт — нажмите «Транслировать» заново'); return; }
+  if (peer.disconnected){
+    dbg('нет связи с сервером — переподключаемся, затем отправим видео');
+    if (!callGuest.waiting){ callGuest.waiting = true; peer.once('open', () => { callGuest.waiting = false; callGuest(); }); }
+    if (!peer.destroyed) peer.reconnect();
+    return;
+  }
   const call = peer.call(conn.peer, P.stream);
   if (!call){ status('⚠️ Не удалось отправить видео'); return; }
   call.on('error', e => status('⚠️ Ошибка видео: ' + (e.type || e)));
@@ -283,11 +289,20 @@ function onCall(call){
   });
 }
 
+// Если связь с сервером пропала — восстанавливаем её сами
+function keepAlive(p){
+  p.on('disconnected', () => {
+    dbg('связь с сервером потеряна, переподключаемся…');
+    setTimeout(() => { if (p.disconnected && !p.destroyed) p.reconnect(); }, 1000);
+  });
+}
+
 function startHost(r){
   isHost = true;
   peer = new Peer(PREFIX + r);
+  keepAlive(peer);
   status('Создаём комнату…');
-  peer.on('open', () => status('Комната «' + r + '» создана. Ждём второго…'));
+  peer.on('open', () => { if (!conn) status('Комната «' + r + '» создана. Ждём второго…'); else dbg('связь с сервером восстановлена'); });
   peer.on('connection', c => { if (conn) conn.close(); setup(c); });
   peer.on('error', err => status(err.type === 'unavailable-id'
     ? 'Этот код уже занят, придумайте другой' : 'Ошибка: ' + err.type));
@@ -296,9 +311,10 @@ function startHost(r){
 $('join').onclick = () => {
   const r = prepare(false); if (!r) return;
   peer = new Peer();
+  keepAlive(peer);
   peer.on('call', onCall);
   status('Подключаемся…');
-  peer.on('open', () => setup(peer.connect(PREFIX + r, { reliable: true })));
+  peer.once('open', () => setup(peer.connect(PREFIX + r, { reliable: true })));
   peer.on('error', err => status(err.type === 'peer-unavailable'
     ? 'Комната не найдена. Сначала второй человек должен нажать «Создать»' : 'Ошибка: ' + err.type));
 };
